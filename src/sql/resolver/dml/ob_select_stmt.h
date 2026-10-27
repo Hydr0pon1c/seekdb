@@ -144,6 +144,7 @@ struct ObSelectIntoItem
   }
   int assign(const ObSelectIntoItem &other) {
     into_type_ = other.into_type_;
+    copy_config_ = other.copy_config_;
     outfile_name_ = other.outfile_name_;
     field_str_ = other.field_str_;
     line_str_ = other.line_str_;
@@ -172,6 +173,7 @@ struct ObSelectIntoItem
                K_(cs_type),
                K_(buffer_size),
                K_(external_properties));
+  common::ObString copy_config_;
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str

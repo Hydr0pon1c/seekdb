@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
 #include "share/ob_time_utility2.h"
@@ -3081,6 +3082,51 @@ int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
   return ret;
 }
 
+int ObSelectResolver::resolve_copy_options(const ParseNode &node, ObSelectIntoItem &item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  FileScanConfig config; config.format = "csv"; config.header = false;
+  if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+  } else if (!enabled) { ret = OB_NOT_SUPPORTED; LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY requires enable_file_sql = ON"); }
+  else if (node.children_[0]->type_ != T_VARCHAR) { ret = OB_INVALID_ARGUMENT; }
+  else { config.path.assign(node.children_[0]->str_value_, node.children_[0]->str_len_); }
+  const ParseNode *options = node.children_[1];
+  for (int64_t i = 0; OB_SUCC(ret) && nullptr != options && i < options->num_child_; ++i) {
+    const ParseNode *option = options->children_[i], *key = option->children_[0], *value = option->children_[1];
+    ObString name(key->str_len_, key->str_value_);
+    std::string text;
+    if (value->type_ == T_VARCHAR) { text.assign(value->str_value_, value->str_len_); }
+    if (name.case_compare("format") == 0) {
+      if (strcasecmp(text.c_str(), "csv") != 0) { ret = OB_NOT_SUPPORTED; }
+    } else if (name.case_compare("header") == 0) {
+      if (value->type_ != T_BOOL && value->type_ != T_INT) { ret = OB_INVALID_ARGUMENT; }
+      else { config.header = value->value_ != 0; }
+    } else if (name.case_compare("nullstr") == 0 || name.case_compare("null") == 0) { config.null_text = text; }
+    else if (name.case_compare("delimiter") == 0 || name.case_compare("delim") == 0 || name.case_compare("sep") == 0
+          || name.case_compare("quote") == 0 || name.case_compare("escape") == 0) {
+      if (text.size() != 1 || text[0] == '\0' || text[0] == '\r' || text[0] == '\n') { ret = OB_INVALID_ARGUMENT; }
+      else if (name.case_compare("quote") == 0) { config.quote = text[0]; }
+      else if (name.case_compare("escape") == 0) { config.escape = text[0]; }
+      else { config.delimiter = text[0]; }
+    } else { ret = OB_INVALID_ARGUMENT; }
+  }
+  if (OB_SUCC(ret) && (config.path.empty() || config.path.find('\0') != std::string::npos || config.delimiter == config.quote)) { ret = OB_INVALID_ARGUMENT; }
+  for (int64_t i = 0; OB_SUCC(ret) && i < get_select_stmt()->get_select_item_size(); ++i) {
+    const SelectItem &select = get_select_stmt()->get_select_item(i);
+    config.columns.push_back(FileColumn{std::string(select.alias_name_.ptr(), select.alias_name_.length()), select.expr_->get_data_type()});
+  }
+  if (OB_SUCC(ret)) {
+    const std::string encoded = config.encode();
+    ret = ob_write_string(*allocator_, ObString(encoded.size(), encoded.data()), item.copy_config_);
+    item.outfile_name_.set_varchar(ObString(node.children_[0]->str_len_, node.children_[0]->str_value_));
+    item.outfile_name_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    get_stmt()->get_query_ctx()->disable_udf_parallel_ = true;
+    get_stmt()->get_query_ctx()->get_query_hint_for_update().get_global_hint().plan_cache_policy_ = OB_USE_PLAN_CACHE_NONE;
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_clause(const ParseNode *node)
 {
   int ret = OB_SUCCESS;
@@ -3105,7 +3151,9 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       new(into_item) ObSelectIntoItem();
       into_item->into_type_ = node->type_;
       if (T_INTO_OUTFILE == node->type_) { // into outfile
-        if (is_in_set_query()) {
+        if (node->value_ == 1 && node->num_child_ == 2) {
+          ret = resolve_copy_options(*node, *into_item);
+        } else if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`

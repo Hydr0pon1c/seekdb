@@ -20,9 +20,11 @@
 #include "sql/engine/ob_operator.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "lib/charset/ob_charset.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 
 namespace oceanbase
 {
+namespace pl { class ObPLCollection; }
 namespace sql
 {
 
@@ -32,11 +34,13 @@ class ObFunctionTableSpec : public ObOpSpec
 OB_UNIS_VERSION_V(1);
 public:
   ObFunctionTableSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
-    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false)
+    : ObOpSpec(alloc, type), value_expr_(nullptr), column_exprs_(alloc), has_correlated_expr_(false), file_column_ids_(alloc)
   {}
   ObExpr *value_expr_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> column_exprs_;
   bool has_correlated_expr_;
+  common::ObString file_scan_config_;
+  common::ObFixedArray<int64_t, common::ObIAllocator> file_column_ids_;
 };
 
 class ObFunctionTableOp : public ObOperator
@@ -60,6 +64,9 @@ public:
 private:
   int inner_get_next_row_udf();
   int inner_get_next_row_sys_func();
+  int inner_get_next_file_row();
+  FileScan file_scan_;
+  std::vector<FileCell> file_row_;
   int get_current_result(common::ObObj &result);
   int64_t node_idx_;
   bool already_calc_;

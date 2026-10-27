@@ -18,6 +18,7 @@
 #define SRC_SQL_ENGINE_BASIC_OB_SELECT_INTO_OP_H_
 
 #include "sql/engine/ob_operator.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "lib/file/ob_file.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
@@ -75,6 +76,7 @@ public:
   {
   }
 
+  common::ObString copy_config_;
   ObItemType into_type_;
   common::ObFixedArray<common::ObString, common::ObIAllocator> user_vars_;
   common::ObObj outfile_name_;
@@ -195,6 +197,16 @@ public:
   virtual void destroy() override;
 
 private:
+  int open_copy();
+  int write_copy_row();
+  int write_copy_fields(const std::vector<FileCell> &fields);
+  int commit_copy();
+  void cleanup_copy();
+  FileScanConfig copy_options_;
+  FILE *copy_file_ = nullptr;
+  int copy_dir_fd_ = -1;
+  std::string copy_temp_path_;
+
   int init_env_common();
   int init_csv_env();
   void set_csv_format_options();

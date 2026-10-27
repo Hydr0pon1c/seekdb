@@ -16,9 +16,13 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
+#include "share/schema/ob_schema_utils.h"
+#include "share/ob_server_struct.h"
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "share/object/ob_obj_cast.h"
+#include "pl/ob_pl.h"
 
 
 namespace oceanbase
@@ -27,14 +31,35 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_scan_config_, file_column_ids_);
 
 int ObFunctionTableOp::inner_open()
 {
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   already_calc_ = false;
-  if (OB_ISNULL(MY_SPEC.value_expr_)) {
+  if (!MY_SPEC.file_scan_config_.empty()) {
+    bool enabled = false;
+    ObString secure_dir;
+    FileScanConfig config;
+    std::string canonical;
+    if (OB_FAIL(GET_MY_SESSION(ctx_)->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+    } else if (!enabled) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (OB_FAIL(MY_SPEC.file_scan_config_.empty() ? OB_ERR_UNEXPECTED : config.decode(MY_SPEC.file_scan_config_))) {
+    } else if (OB_FAIL(share::schema::ObSchemaUtils::get_runtime_varchar_variable(*GCTX.schema_service_, share::SYS_VAR_SECURE_FILE_PRIV, ctx_.get_allocator(), secure_dir))) {
+    } else if (OB_FAIL(FileScan::check_access(config.path, secure_dir, canonical))) {
+    } else if (canonical != config.path) {
+      ret = OB_STATE_NOT_MATCH;
+    } else if (OB_FAIL(file_scan_.open(config))) {
+    } else if (OB_FAIL(file_scan_.rescan())) {
+    } else {
+      std::vector<int64_t> columns;
+      for (int64_t i = 0; i < MY_SPEC.file_column_ids_.count(); ++i) { columns.push_back(MY_SPEC.file_column_ids_.at(i)); }
+      file_scan_.set_projection(columns);
+      next_row_func_ = &ObFunctionTableOp::inner_get_next_file_row;
+    }
+  } else if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
@@ -47,7 +72,9 @@ int ObFunctionTableOp::inner_open()
 int ObFunctionTableOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObOperator::inner_rescan())) {
+  if (!MY_SPEC.file_scan_config_.empty()) {
+    ret = file_scan_.rescan();
+  } else if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
     node_idx_ = 0;
     if (MY_SPEC.has_correlated_expr_) {
@@ -62,6 +89,7 @@ int ObFunctionTableOp::inner_rescan()
 
 int ObFunctionTableOp::inner_close()
 {
+  file_scan_.close();
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   row_count_ = 0;
@@ -72,6 +100,9 @@ int ObFunctionTableOp::inner_close()
 
 void ObFunctionTableOp::destroy()
 {
+  file_scan_.close();
+  file_scan_.~FileScan();
+  file_row_.~vector();
   ObOperator::destroy();
 }
 
@@ -102,6 +133,44 @@ int ObFunctionTableOp::get_current_result(ObObj &result)
 int ObFunctionTableOp::inner_get_next_row()
 {
   return (this->*next_row_func_)();
+}
+
+int ObFunctionTableOp::inner_get_next_file_row()
+{
+  clear_evaluated_flag();
+  int ret = ctx_.check_status();
+  if (OB_SUCC(ret)) { ret = file_scan_.next(file_row_); }
+  const ObDataTypeCastParams parameters = ObBasicSessionInfo::create_dtc_params(GET_MY_SESSION(ctx_));
+  ObEvalCtx::TempAllocGuard guard(eval_ctx_);
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+    ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+    const int64_t column = MY_SPEC.file_column_ids_.at(i);
+    if (column < 0 || column >= file_row_.size()) { ret = OB_ERR_UNEXPECTED; break; }
+    const FileCell &cell = file_row_[column];
+    ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+    if (cell.is_null) { datum.set_null(); }
+    else {
+      ObObj source, target;
+      source.set_varchar(ObString(cell.text.size(), cell.text.data()));
+      source.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+      if (expr->obj_meta_.get_type() == ObTinyIntType) {
+        target.set_tinyint(strcasecmp(cell.text.c_str(), "true") == 0 ? 1 : 0);
+      } else {
+        ObCastCtx cast(&guard.get_allocator(), &parameters, CM_NONE, CS_TYPE_UTF8MB4_BIN);
+        ret = ObObjCaster::to_type(expr->obj_meta_.get_type(), expr->obj_meta_.get_collation_type(), cast, source, target);
+      }
+      if (OB_SUCC(ret)) {
+        if (ob_is_string_type(target.get_type())) {
+          const ObString value = target.get_string();
+          char *data = expr->get_str_res_mem(eval_ctx_, value.length());
+          if (nullptr == data && !value.empty()) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+          else { if (!value.empty()) { MEMCPY(data, value.ptr(), value.length()); } datum.set_string(data, value.length()); }
+        } else { ret = datum.from_obj(target); }
+      }
+    }
+    if (OB_SUCC(ret)) { expr->set_evaluated_projected(eval_ctx_); }
+  }
+  return ret;
 }
 
 int ObFunctionTableOp::inner_get_next_row_udf()

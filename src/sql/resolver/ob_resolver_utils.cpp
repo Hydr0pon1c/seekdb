@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "config_bridge.h"
 #include "share/config/ob_config_helper.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
@@ -120,6 +121,17 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
                                                          ObResolverParams &params,
                                                          ObIArray<ObString> &column_names)
 {
+  if (!table_item.file_scan_config_.empty()) {
+    FileScanConfig config;
+    int ret = config.decode(table_item.file_scan_config_);
+    for (size_t i = 0; OB_SUCC(ret) && i < config.columns.size(); ++i) {
+      ObString name;
+      if (OB_FAIL(ob_write_string(*params.allocator_, ObString(config.columns[i].name.size(), config.columns[i].name.data()), name))) {
+      } else if (OB_FAIL(column_names.push_back(name))) {
+      }
+    }
+    return ret;
+  }
   int ret = OB_SUCCESS;
   ObRawExpr *table_expr = NULL;
   ObPLPackageGuard *package_guard = nullptr;

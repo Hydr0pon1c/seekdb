@@ -5450,6 +5450,10 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   UNUSED(in_root_job);
   ObIAllocator &alloc = phy_plan_->get_allocator();
   int ret = OB_SUCCESS;
+  const ObSelectIntoItem *into = static_cast<const ObSelectStmt *>(op.get_stmt())->get_select_into();
+  if (nullptr != into && !into->copy_config_.empty()) {
+    ret = ob_write_string(alloc, into->copy_config_, spec.copy_config_);
+  }
   if (OB_UNLIKELY(1 != op.get_num_of_child())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(deep_copy_obj(alloc, op.get_outfile_name(), spec.outfile_name_))) {
@@ -5509,6 +5513,12 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(generate_rt_expr(*value_raw_expr, value_expr))) {
   } else {
+    const TableItem *table = op.get_stmt()->get_table_item_by_id(op.get_table_id());
+    if (nullptr != table && !table->file_scan_config_.empty()) {
+      if (OB_FAIL(ob_write_string(alloc, table->file_scan_config_, spec.file_scan_config_))) {
+      } else if (OB_FAIL(spec.file_column_ids_.init(op.get_stmt()->get_column_size()))) {
+      }
+    }
     spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
     spec.value_expr_ = value_expr;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
@@ -5526,6 +5536,9 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
         OZ (spec.column_exprs_.push_back(rt_expr));
+        if (!spec.file_scan_config_.empty()) {
+          OZ (spec.file_column_ids_.push_back(col_item->column_id_ - OB_APP_MIN_COLUMN_ID));
+        }
       }
     }
   }

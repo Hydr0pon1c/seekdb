@@ -15,6 +15,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/parser/ob_parser.h"
+#include "lib/string/ob_sql_string.h"
 #include "sql/resolver/ob_resolver.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -148,6 +150,54 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   do {                                                                        \
     ret = select_stmt_resolver_func<Ob##name##Resolver>(params_, parse_tree, stmt); \
   } while (0)
+  if (parse_tree.type_ == T_EXPLAIN && nullptr != parse_tree.children_[0]
+      && parse_tree.children_[0]->type_ == T_INT && parse_tree.children_[0]->value_ == 1
+      && parse_tree.num_child_ == 5 && nullptr != parse_tree.children_[4]
+      && parse_tree.children_[4]->type_ == T_SELECT) {
+    ObResolver source(params_);
+    ObStmt *source_stmt = nullptr;
+    int ret = source.resolve(if_prepared, *parse_tree.children_[4], source_stmt);
+    ObSqlString sql;
+    auto literal = [&](const ObString &text) {
+      int status = sql.append("convert(0x");
+      const char hex[] = "0123456789abcdef";
+      for (int64_t i = 0; status == OB_SUCCESS && i < text.length(); ++i) {
+        const unsigned char ch = text.ptr()[i];
+        char pair[] = {hex[ch >> 4], hex[ch & 15]}; status = sql.append(pair, 2);
+      }
+      if (status == OB_SUCCESS) { status = sql.append(" using utf8mb4)"); }
+      return status;
+    };
+    if (OB_SUCC(ret)) {
+      const ObSelectStmt *select = static_cast<const ObSelectStmt *>(source_stmt);
+      for (int64_t i = 0; OB_SUCC(ret) && i < select->get_select_item_size(); ++i) {
+        const SelectItem &item = select->get_select_item(i);
+        const ObObjType type = item.expr_->get_data_type();
+        const char *name = type == ObIntType ? "BIGINT" : type == ObDoubleType ? "DOUBLE"
+            : type == ObTinyIntType ? "BOOLEAN" : type == ObDateType ? "DATE"
+            : type == ObDateTimeType ? "DATETIME" : "VARCHAR";
+        if (OB_FAIL(sql.append(i == 0 ? "select " : " union all select "))) {
+        } else if (OB_FAIL(literal(item.alias_name_))) {
+        } else if (OB_FAIL(sql.append(" as column_name, "))) {
+        } else if (OB_FAIL(literal(ObString(name)))) {
+        } else if (OB_FAIL(sql.append_fmt(" as column_type, '%s' as `null`, NULL as `key`, NULL as `default`, NULL as extra",
+                       (item.expr_->get_result_flag() & NOT_NULL_FLAG) != 0 ? "NO" : "YES"))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode());
+      ParseResult parsed;
+      if (OB_FAIL(parser.parse(sql.string(), parsed))) {
+      } else if (nullptr == parsed.result_tree_ || parsed.result_tree_->num_child_ < 1) { ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObResolver metadata(params_);
+        ret = metadata.resolve(if_prepared, *parsed.result_tree_->children_[0], stmt);
+      }
+    }
+    params_.query_ctx_->get_query_hint_for_update().get_global_hint().plan_cache_policy_ = OB_USE_PLAN_CACHE_NONE;
+    return ret;
+  }
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_resolve);
   int ret = OB_SUCCESS;
   const ParseNode *real_parse_tree = NULL;

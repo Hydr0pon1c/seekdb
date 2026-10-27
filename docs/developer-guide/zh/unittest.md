@@ -73,3 +73,38 @@ make -C build_release pretest
 ```
 
 适合并行执行时，可以向 `run_tests.sh` 传入 `-j <jobs>`。Pull Request 的 CI 也会运行单元测试和 mysqltest。请在 Pull Request 描述中记录实际执行的目标和筛选条件。
+
+## 比赛分支的 SQL 扩展回归
+
+`sql_tests` 包含 AI Prompt/Provider 响应校验、CSV/JSONL 类型推断与扫描、
+Parquet V1/V2 数据页及 Snappy、文件变化与路径检查、文件 SQL/COPY 解析测试。
+
+```bash
+make -C build_release -j8 sql_tests
+./build_release/unittest/run_tests.sh -R '^sql_tests_shard_0$' --output-on-failure
+```
+
+端到端测试需要一个本地 seekdb 实例和 Python `pymysql`。在两个终端分别运行：
+
+```bash
+python3 unittest/sql/engine/expr/mock_ai_service.py --port 8000
+```
+
+```bash
+python3 unittest/sql/test_competition_integration.py \
+  --port 2881 --fixture-parent /path/allowed/by/secure_file_priv
+```
+
+集成测试使用独立的临时文件和带随机前缀的表/模型/Endpoint，并在结束时清理。
+它验证 seekdb 原生聚合、过滤、排序、跨格式 JOIN、DESCRIBE、COPY 读回及失败清理，
+以及 AI 请求配置、Ollama Provider 修改、Embedding 多输入请求与跨行映射、Rerank 分批稳定排序。
+Mock 默认返回 768 维 Embedding，并反转 OpenAI Embedding 响应顺序；显式维度来自请求参数。
+它只用于测试，不需要真实模型或 API Key。
+
+文件 SQL 默认关闭；SQL 会话中需先设置 `SET enable_file_sql=ON`。
+`secure_file_priv` 仍限制读取和 COPY 导出的目录，修改该变量须通过实例的 Unix Socket 连接。
+当前文件扫描实现面向 Linux 单进程；Parquet 支持扁平基础类型、可空列、多个 Row Group、
+PLAIN/字典/RLE 编码、未压缩或 Snappy 压缩，以及按查询引用列读取。
+CSV/JSONL Schema 做独立的全量扫描，随后逐记录执行查询；`sample_size` 仅接受 `-1`。
+单条记录/数据页上限为 16 MiB，列数上限为 1024，Parquet 页/字典保留内存上限为 128 MiB，
+`glob` 最多发现 10000 个普通文件。其他编码或嵌套结构会明确报错。
